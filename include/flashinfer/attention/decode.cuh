@@ -77,6 +77,9 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                            const float logits_soft_cap) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
+//tile_size=bdy*tile_size_per_bdx, 对于bdy的每个线程， q load属于自己query head的vec_size个元素然后和k的tile_size个元素做点积
+//q/k:shape[#S,  vec_size]
+//q:[1, vec_size], k:[bdy*tile_size_per_bdx, vec_size]
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> k_vec;
@@ -301,6 +304,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
+    //计算matmu(q,k)以及online softmax
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, left_close_bound,
@@ -394,14 +398,19 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   auto block = cg::this_thread_block();
   sm_scale *=
       (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
-
+  
+  //1. Every threads load vec_size elements. blockDimx.x threads to load head_dim = bdx*(vec_size)
   constexpr uint32_t head_dim = bdx * vec_size;
+  //nblks(batch_size,num_kv_heads)
   const uint32_t batch_idx = blockIdx.x;
   const uint32_t kv_head_idx = blockIdx.y;
+  //nthreads(bdx, bdy, bdz)  bdy=GROUP_SIZE, bdz=num_theads/(bdx*bdy)
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   const uint32_t num_qo_heads = gridDim.y * bdy;
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   const uint32_t cur_chunk_start = partition_kv ? kv_partition_info.chunk_start_pos[batch_idx] : 0U;
+
+  //The page id information of the current batch [cur_page_indptr_begin, cur_page_indptr_end)
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
   // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
@@ -419,7 +428,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       (window_left >= 0) ? sub_if_greater_or_zero(seq_len, window_left + 1) : 0;
   const uint32_t mapped_batch_idx =
       partition_kv ? kv_partition_info.batch_idx_map[batch_idx] : batch_idx;
-
+  
+  //bdx threads to load a head_dim of a token, there are tok_per_iter=tile_size_per_bdx * bdy * bdz tokens to load of a thread block
+  //but why need num_stages_smem stages(double buffer, load next tok_per_iter when compute this stage) 
+  // how about tile_size_per_bdx tiles? 
   extern __shared__ uint8_t smem[];
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
@@ -462,9 +474,13 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const IdType last_indptr = paged_kv.indptr[gridDim.x];
 
   static_assert(num_stages_smem <= bdx);
+  //预取page slot 信息到shared memory
+  //page kv cache block table: mappping logical token id: [0, tile_size_per_bdx*bdz*bdy*bdx) to physical slot(q, r)
+  //shared memory cache: 每次读取 num_stages_smem * bdz * bdy *tile_size_per_bdx
+  //num_stages_smem <= bdx 是保证把kv cache 从global memory读取到smem的时候 logical id不超过k_ptrs_smem chached 的范围
 #pragma unroll
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-    uint32_t q, r;
+    uint32_t q, r;    
     paged_kv.page_size.divmod(((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
     k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
         paged_kv.protective_get_k_ptr(cur_page_indptr_begin + q, kv_head_idx, r, 0, last_indptr);
@@ -472,15 +488,25 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   block.sync();
 
   DTypeKV* k_ptrs[tile_size_per_bdx];
+
+//从 global memory 读取 num_stages_smem * bdz * bdy *tile_size_per_bdx 个token到 smem
+//每个线程 (ID: [threadIdx.x, threadIdx.y, threadIdx.z]) 读取 num_stages_smems * tile_size_per_bdx * vec_size个元素
+// token id 的坐标值 (num_stages_smem, bdz, bdy, tile_size_per_bdx) -> logical sequence id
+//在一个 warp schedule中，x dim的相邻的 bdx 个线程读取一个token的head_dim 元素, 如何保证没有 stride read 来避免无效memory read呢？
+//相邻的bdx线程都是同一个logical id，这是不是smem会broadcase避免bank conflict?
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
 #pragma unroll
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {      
       k_ptrs[j] =
-          k_ptrs_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
+          k_ptrs_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size; 
+
     }
 #pragma unroll
+    //总共load 进来[bdz, bdy, title_size_per_bdx] 个token, tile_size_per_token维度连续
+    //这样保证在算 compute_qk的时候，每个q和 dy*tile_size_per_token做计算的时候是连续的从smem里面读， 如何保障没有bank conflict 呢？
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      //每个iteration load 进来 bdy*bdz token
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -504,7 +530,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 
 #pragma unroll 2
   for (uint32_t iter = 0; iter < ceil_div(kv_chunk_len, tile_size_per_bdx * bdy * bdz); ++iter) {
+    //即将超过缓存的tile_size_per_bdx * bdy * bdz*bdx个logical id -> page slot信息， 需要重新缓存新的token logical id -> page slot  
     if ((iter + num_stages_smem) % bdx == 0) {
+      // load k_ptrs
 #pragma unroll
       for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
         uint32_t q, r;
@@ -515,7 +543,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
             cur_page_indptr_begin + q, kv_head_idx, r, 0, last_indptr);
       }
     }
-    // compute qk
+    // compute qk 以及online softmax
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
@@ -801,3 +829,4 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_DECODE_CUH_
+
